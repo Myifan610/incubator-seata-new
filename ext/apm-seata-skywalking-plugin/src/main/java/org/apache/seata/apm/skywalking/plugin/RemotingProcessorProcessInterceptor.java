@@ -3,6 +3,7 @@ package org.apache.seata.apm.skywalking.plugin;
 import com.alipay.sofa.common.profile.StringUtil;
 import org.apache.seata.apm.skywalking.plugin.common.SWSeataUtils;
 import org.apache.seata.core.protocol.AbstractMessage;
+import org.apache.seata.core.protocol.HeartbeatMessage;
 import org.apache.seata.core.protocol.RpcMessage;
 import org.apache.skywalking.apm.agent.core.context.CarrierItem;
 import org.apache.skywalking.apm.agent.core.context.ContextCarrier;
@@ -18,15 +19,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Method;
+import java.util.Map;
 
 public class RemotingProcessorProcessInterceptor implements InstanceMethodsAroundInterceptor {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RemotingProcessorProcessInterceptor.class);
 
     /**
-     * ThreadLocal 标记：当前线程是否在 beforeMethod 中成功创建了 entry span
-     * 使用 ThreadLocal 而不是 EnhancedInstance 的 dynamicField 是因为处理器可能被多个 Netty 线程复用，
-     * 我们需要按线程区分 span 的创建与停止。
+     * ThreadLocal 标记当前线程是否已成功创建 Span。
+     * 使用 ThreadLocal 是因为 Netty 线程会被线程池复用，需要逐线程跟踪创建/停止状态。
      */
     private static final ThreadLocal<Boolean> SPAN_CREATED = new ThreadLocal<>();
 
@@ -42,6 +43,16 @@ public class RemotingProcessorProcessInterceptor implements InstanceMethodsAroun
         return null;
     }
 
+    /**
+     * 判断是否为心跳包，如果是心跳包，我们跳过监控以减少短生命周期高频 span 的产生。
+     */
+    private boolean isHeartbeat(RpcMessage rpcMessage) {
+        if (rpcMessage == null || rpcMessage.getBody() == null) {
+            return false;
+        }
+        return rpcMessage.getBody() instanceof HeartbeatMessage;
+    }
+
     @Override
     public void beforeMethod(
             EnhancedInstance objInst,
@@ -52,7 +63,9 @@ public class RemotingProcessorProcessInterceptor implements InstanceMethodsAroun
             throws Throwable {
 
         RpcMessage rpcMessage = findRpcMessage(allArguments);
-        if (rpcMessage == null) {
+
+        // 若无消息或为心跳包，直接返回，不创建 span
+        if (rpcMessage == null || isHeartbeat(rpcMessage)) {
             return;
         }
 
@@ -60,35 +73,41 @@ public class RemotingProcessorProcessInterceptor implements InstanceMethodsAroun
             String operationName = SWSeataUtils.convertOperationName(rpcMessage);
             ContextCarrier contextCarrier = new ContextCarrier();
             CarrierItem next = contextCarrier.items();
-            // 如果 headMap 为 null，避免 NPE
+
             Object headMap = rpcMessage.getHeadMap();
             while (next.hasNext()) {
                 next = next.next();
                 try {
-                    if (headMap != null) {
-                        Object val = ((java.util.Map) headMap).get(next.getHeadKey());
+                    if (headMap instanceof Map) {
+                        Object val = ((Map<?, ?>) headMap).get(next.getHeadKey());
                         if (val != null) {
                             next.setHeadValue(String.valueOf(val));
                         }
                     }
-                } catch (Throwable ignore) {
-                    // 如果 head map 的结构不符合预期，忽略单个 header 的注入，继续处理其余 header
-                    LOGGER.debug("Failed to set head value for key {}", next.getHeadKey(), ignore);
+                } catch (Throwable headerEx) {
+                    // 单个 header 解析失败不影响整体 tracing
+                    LOGGER.debug("Failed to set header value for key {}", next.getHeadKey(), headerEx);
                 }
             }
+
             AbstractSpan activeSpan = ContextManager.createEntrySpan(operationName, contextCarrier);
             SpanLayer.asRPCFramework(activeSpan);
             activeSpan.setComponent(ComponentsDefine.SEATA);
 
-            String xid = SWSeataUtils.convertXid(rpcMessage);
-            if (StringUtil.isNotBlank(xid)) {
-                activeSpan.tag(new StringTag(20, "Seata.xid"), xid);
+            try {
+                String xid = SWSeataUtils.convertXid(rpcMessage);
+                if (StringUtil.isNotBlank(xid)) {
+                    activeSpan.tag(new StringTag(20, "Seata.xid"), xid);
+                }
+            } catch (Throwable xidEx) {
+                // 忽略 XID 提取中的异常，避免影响业务
+                LOGGER.debug("Failed to extract XID from RpcMessage", xidEx);
             }
 
-            // 标记当前线程成功创建了 span
+            // 标记当前线程已创建 span
             SPAN_CREATED.set(Boolean.TRUE);
         } catch (Throwable t) {
-            // 捕获任何 tracing 相关的异常，避免影响业务处理
+            // tracing 相关任何异常都不应该影响业务流程
             SPAN_CREATED.remove();
             LOGGER.warn("SkyWalking tracing failed in RemotingProcessorProcessInterceptor.beforeMethod, skip tracing for this call.", t);
         }
@@ -100,20 +119,16 @@ public class RemotingProcessorProcessInterceptor implements InstanceMethodsAroun
             throws Throwable {
 
         try {
-            RpcMessage rpcMessage = findRpcMessage(allArguments);
             if (Boolean.TRUE.equals(SPAN_CREATED.get())) {
-                // 只有在 beforeMethod 确实创建了 span 时才停止
                 try {
-                    if (rpcMessage != null && rpcMessage.getBody() instanceof AbstractMessage) {
-                        ContextManager.stopSpan();
-                    }
+                    ContextManager.stopSpan();
                 } catch (Throwable stopEx) {
                     LOGGER.warn("SkyWalking stopSpan failed in RemotingProcessorProcessInterceptor.afterMethod.", stopEx);
                 }
             }
             return ret;
         } finally {
-            // 清理 ThreadLocal，防止内存泄露或复用线程时残留标记
+            // 一定要清理，避免线程池重用时残留状态
             SPAN_CREATED.remove();
         }
     }
@@ -121,10 +136,23 @@ public class RemotingProcessorProcessInterceptor implements InstanceMethodsAroun
     @Override
     public void handleMethodException(
             EnhancedInstance objInst, Method method, Object[] allArguments, Class<?>[] argumentsTypes, Throwable t) {
-        // 当方法抛异常时也尝试做清理，避免 tracing 导致二次异常影响业务
         try {
             if (Boolean.TRUE.equals(SPAN_CREATED.get())) {
                 try {
+                    // 尝试将异常记录到当前 span (若 agent API 支持)
+                    try {
+                        Object current = ContextManager.activeSpan();
+                        if (current instanceof AbstractSpan) {
+                            try {
+                                ((AbstractSpan) current).errorOccurred().log(t);
+                            } catch (Throwable logEx) {
+                                LOGGER.debug("Unable to log exception to active span", logEx);
+                            }
+                        }
+                    } catch (Throwable activeEx) {
+                        // 忽略 activeSpan() API 差异导致的问题
+                        LOGGER.debug("Unable to obtain active span for logging", activeEx);
+                    }
                     ContextManager.stopSpan();
                 } catch (Throwable stopEx) {
                     LOGGER.warn("SkyWalking stopSpan failed in RemotingProcessorProcessInterceptor.handleMethodException.", stopEx);
